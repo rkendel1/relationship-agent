@@ -7,21 +7,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createTestApp } from "@feltdb/feltkit/testing";
 import { api } from "../feltkit/_generated/api.js";
-
-type T = Awaited<ReturnType<typeof createTestApp>>;
+import { approveAndDeliver, notificationsFor, profile, reviewHash, type T } from "./_helpers.js";
 
 const CONTACTS = `name,email,organization,title,notes,topics
 Barbara Liskov,barbara@example.org,MIT,Professor,"Reviewed my database design in 2025; deep on durable systems",databases;distributed systems
 Ken Thompson,ken@example.org,Initech,Engineer,Built operating systems,operating systems
 Edsger Dijkstra,,Eindhoven,Professor,Algorithms and correctness,algorithms
 `;
-
-const profile = (displayName: string, extra: Record<string, unknown> = {}) => ({ displayName, headline: "", projects: [], expertise: [], needs: [], boundaries: "", openToIntroductions: false, introTopics: [], ...extra });
-
-async function notificationsFor(t: T, recipient: string) {
-  const all = await t.runtime.instance.handle("test").collection<{ recipient: string; type: string; data?: { introductionId?: string } }>("notifications").find({});
-  return all.filter((n) => n.recipient === recipient);
-}
 
 /** Ada (requester) with imported contacts; Linus, a participant open to database introductions. */
 async function setup(t: T, briefText = "Find me someone who can evaluate a Boundry/FeltKit project on durable databases.") {
@@ -76,14 +68,18 @@ test("vertical slice: brief → evidence-backed matches → approved request →
     assert.deepEqual(await linus.query(api.introductions.incoming), [], "a draft is invisible to the recipient");
     assert.equal((await notificationsFor(t, "linus")).length, 0);
 
-    // The owner approves the exact preview. A stale preview is refused.
-    const previewed = intro.__version;
+    // The owner approves the exact content they reviewed. A stale review (hash) is refused.
+    const previewed = await reviewHash(ada, introId, "in_app");
     await ada.mutation(api.introductions.edit, { id: introId, sharedContext: intro.sharedContext, message: `${intro.message} Thanks!`, requesterFields: ["headline", "email"] });
-    await assert.rejects(ada.mutation(api.introductions.approve, { id: introId, version: previewed }), { code: "FAILED_PRECONDITION" });
-    intro = await ada.query(api.introductions.get, { id: introId });
-    assert.deepEqual(await ada.mutation(api.introductions.approve, { id: introId, version: intro.__version }), { state: "consent_requested", alreadyApplied: false });
-    // Duplicate delivery: approving again is a no-op and sends nothing new.
-    assert.deepEqual(await ada.mutation(api.introductions.approve, { id: introId, version: intro.__version }), { state: "consent_requested", alreadyApplied: true });
+    await assert.rejects(ada.mutation(api.introductions.approve, { id: introId, channel: "in_app", contentHash: previewed }), { code: "FAILED_PRECONDITION" });
+    const reviewed = await reviewHash(ada, introId, "in_app");
+    const first = await ada.mutation(api.introductions.approve, { id: introId, channel: "in_app", contentHash: reviewed });
+    assert.deepEqual([first.state, first.status, first.alreadyApplied], ["approved", "queued", false]);
+    assert.deepEqual(await linus.query(api.introductions.incoming), [], "approved but not yet delivered: invisible to the recipient");
+    await t.runtime.runServices();
+    // Duplicate approval: a no-op that sends nothing new.
+    const again = await ada.mutation(api.introductions.approve, { id: introId, channel: "in_app", contentHash: reviewed });
+    assert.deepEqual([again.state, again.status, again.alreadyApplied, again.deliveryId], ["consent_requested", "sent", true, first.deliveryId]);
     await t.runtime.runServices();
     const requested = (await notificationsFor(t, "linus")).filter((n) => n.type === "introduction.requested");
     assert.equal(requested.length, 1, "one notification, despite two approvals");
@@ -116,7 +112,7 @@ test("vertical slice: brief → evidence-backed matches → approved request →
 
     // The history is append-only and complete.
     intro = await ada.query(api.introductions.get, { id: introId });
-    assert.deepEqual(intro.events.map((e) => e.to), ["consent_requested", "introduced", "completed"]);
+    assert.deepEqual(intro.events.map((e) => e.to), ["approved", "consent_requested", "introduced", "completed"]);
     const actions = (await ada.query(api.privacy.auditLog, {})).map((a) => a.action);
     for (const a of ["brief.drafted", "brief.confirmed", "brief.matched", "introduction.drafted", "introduction.consent_requested", "introduction.introduced", "introduction.completed"]) assert.ok(actions.includes(a), a);
     assert.ok(!JSON.stringify(await ada.query(api.privacy.auditLog, {})).includes("@example.org"), "audit never holds contact details");
@@ -135,7 +131,7 @@ test("decline with block: no disclosure, and the requester cannot ask again", as
     const { ada, linus, found } = await setup(t);
     const m = found.find((x) => x.participant)!;
     const id = await ada.mutation(api.introductions.draft, { matchId: m.id });
-    await ada.mutation(api.introductions.approve, { id, version: (await ada.query(api.introductions.get, { id })).__version });
+    await approveAndDeliver(t, ada, id);
     assert.deepEqual(await linus.mutation(api.introductions.respond, { id, accept: false, fields: [], block: true }), { state: "declined" });
     assert.deepEqual((await ada.query(api.introductions.get, { id })).disclosed, {});
     await assert.rejects(linus.mutation(api.introductions.respond, { id, accept: true, fields: ["email"] }), { code: "FAILED_PRECONDITION" }, "a declined request cannot be accepted later");
@@ -143,7 +139,7 @@ test("decline with block: no disclosure, and the requester cannot ask again", as
     // A new draft for the same match is allowed, but approval is refused: Linus blocked Ada.
     const again = await ada.mutation(api.introductions.draft, { matchId: m.id });
     assert.notEqual(again, id);
-    await assert.rejects(ada.mutation(api.introductions.approve, { id: again, version: (await ada.query(api.introductions.get, { id: again })).__version }), { code: "FAILED_PRECONDITION" });
+    await assert.rejects(ada.mutation(api.introductions.approve, { id: again, channel: "in_app", contentHash: await reviewHash(ada, again, "in_app") }), { code: "FAILED_PRECONDITION" });
     // And a later brief no longer discovers Linus through the network.
     const b2 = await ada.mutation(api.briefs.create, { text: "Someone who knows feltkit storage" });
     await ada.mutation(api.briefs.confirm, { id: b2 });
@@ -162,12 +158,12 @@ test("withdrawal and expiry: an unanswered request can be withdrawn, and expires
     const { ada, linus, found } = await setup(t);
     const m = found.find((x) => x.participant)!;
     const first = await ada.mutation(api.introductions.draft, { matchId: m.id });
-    await ada.mutation(api.introductions.approve, { id: first, version: (await ada.query(api.introductions.get, { id: first })).__version });
+    await approveAndDeliver(t, ada, first);
     await ada.mutation(api.introductions.withdraw, { id: first });
     await assert.rejects(linus.mutation(api.introductions.respond, { id: first, accept: true, fields: [] }), { code: "FAILED_PRECONDITION" });
 
     const second = await ada.mutation(api.introductions.draft, { matchId: m.id });
-    await ada.mutation(api.introductions.approve, { id: second, version: (await ada.query(api.introductions.get, { id: second })).__version });
+    await approveAndDeliver(t, ada, second);
     Date.now = () => realNow() + 15 * 86400000; // past the 14-day deadline
     assert.deepEqual(await linus.mutation(api.introductions.respond, { id: second, accept: true, fields: ["email"] }), { state: "expired" });
     assert.deepEqual((await ada.query(api.introductions.get, { id: second })).disclosed, {});
@@ -185,7 +181,7 @@ test("the expire-due job expires overdue requests for whoever queued it", async 
     const { ada, found } = await setup(t);
     const m = found.find((x) => x.participant)!;
     const id = await ada.mutation(api.introductions.draft, { matchId: m.id });
-    await ada.mutation(api.introductions.approve, { id, version: (await ada.query(api.introductions.get, { id })).__version });
+    await approveAndDeliver(t, ada, id);
     Date.now = () => realNow() + 15 * 86400000;
     assert.deepEqual(await ada.mutation(api.introductions.expireDue, {}), { expired: 1 });
     assert.equal((await ada.query(api.introductions.get, { id })).state, "expired");
@@ -204,7 +200,8 @@ test("manual path: without an outbound connector, the app never claims delivery"
     const intro = await ada.query(api.introductions.get, { id });
     assert.equal(intro.path, "manual");
     assert.ok(!intro.message.includes("barbara@example.org"), "her private address is never put in the text");
-    assert.deepEqual(await ada.mutation(api.introductions.approve, { id, version: intro.__version }), { state: "manual_ready", alreadyApplied: false });
+    const approved = await ada.mutation(api.introductions.approve, { id, channel: "manual", contentHash: await reviewHash(ada, id, "manual") });
+    assert.deepEqual([approved.state, approved.status], ["manual_ready", "manual_action_required"]);
     await ada.mutation(api.introductions.markSent, { id });
     await ada.mutation(api.introductions.markSent, { id }); // idempotent
     assert.equal((await ada.query(api.introductions.get, { id })).state, "manual_sent");
@@ -224,7 +221,7 @@ test("the disclosure scan refuses to send private details", async () => {
     const id = await ada.mutation(api.introductions.draft, { matchId: m.id });
     const intro = await ada.query(api.introductions.get, { id });
     await ada.mutation(api.introductions.edit, { id, sharedContext: intro.sharedContext, message: "Barbara (barbara@example.org) said you'd help.", requesterFields: [] });
-    await assert.rejects(ada.mutation(api.introductions.approve, { id, version: (await ada.query(api.introductions.get, { id })).__version }), (e: { code: string; message: string }) => e.code === "FAILED_PRECONDITION" && e.message.includes("barbara@example.org"));
+    await assert.rejects(ada.mutation(api.introductions.approve, { id, channel: "in_app", contentHash: await reviewHash(ada, id, "in_app") }), (e: { code: string; message: string }) => e.code === "FAILED_PRECONDITION" && e.message.includes("barbara@example.org"));
     assert.equal((await ada.query(api.introductions.get, { id })).state, "draft");
   } finally {
     await t.close();
@@ -304,7 +301,7 @@ test("relationship states are earned: only the owner attests, and attestation ne
     assert.equal(await ada.mutation(api.people.attest, { personId: barbara.personId, state: "known", note: "She reviewed my thesis." }), "known");
     const agent = t.as({ id: "helper", type: "agent", roles: ["agent"] });
     await assert.rejects(agent.mutation(api.people.attest, { personId: barbara.personId, state: "connected", note: "trust me" }), { code: "FORBIDDEN" });
-    await assert.rejects(agent.mutation(api.introductions.approve, { id: "x", version: 1 }), { code: "FORBIDDEN" });
+    await assert.rejects(agent.mutation(api.introductions.approve, { id: "x", channel: "in_app", contentHash: "x" }), { code: "FORBIDDEN" });
   } finally {
     await t.close();
   }

@@ -10,50 +10,16 @@
  *   themselves and records that they did. The app never claims to have delivered it.
  */
 import { fail, s } from "@feltdb/feltkit";
-import { app, blocks, briefs, consentGrants, evidence, introductionEvents, introductions, matches, people, profiles, SHAREABLE_FIELDS } from "./app.js";
+import { app, approvals, blocks, briefs, consentGrants, deliveries, DELIVERY_CHANNELS, evidence, introductionEvents, introductions, matches, people, SHAREABLE_FIELDS } from "./app.js";
 import { audit, currentEvidence, ensureSource, me, owned, relationshipState, transitionRelationship } from "./_access.js";
-import { canMoveIntroduction, isExcluded, scanDisclosure, type IntroState } from "./_rules.js";
+import { APPROVAL_TTL_MS, channelOptions, displayStatus } from "./_delivery.js";
+import { currentDelivery, DAILY_REQUEST_LIMIT, GRANT_TTL_MS, move, profileOf, reviewFor, type Field, type Intro } from "./_flow.js";
+import { isExcluded, scanDisclosure } from "./_rules.js";
 import { overlap, truncate } from "./_text.js";
 
-export const REQUEST_TTL_MS = 14 * 24 * 60 * 60 * 1000;
-export const GRANT_TTL_MS = 90 * 24 * 60 * 60 * 1000;
-export const DAILY_REQUEST_LIMIT = 10;
+export { DAILY_REQUEST_LIMIT, GRANT_TTL_MS, REQUEST_TTL_MS } from "./_flow.js";
 
-type Field = (typeof SHAREABLE_FIELDS)[number];
-type Intro = {
-  id: string;
-  __version: number;
-  ownerId: string;
-  briefId: string;
-  matchId: string;
-  personId: string;
-  recipientUserId?: string;
-  path: "participant" | "manual";
-  state: IntroState;
-  sharedContext: string;
-  requesterFields: Field[];
-  message: string;
-  idempotencyKey: string;
-  requestedAt?: number;
-  expiresAt?: number;
-  followUpAt?: number;
-  outcomeNote?: string;
-  createdAt: number;
-  updatedAt: number;
-};
 type Brief = { ownerId: string; target: string; topics: string[]; confidential: boolean; excludedOrganizations: string[]; excludedPersonIds: string[]; geography?: string };
-
-async function move(ctx: any, intro: Intro, to: IntroState, patch: Partial<Intro> = {}): Promise<void> {
-  if (!canMoveIntroduction(intro.state, to)) fail("FAILED_PRECONDITION", `An introduction that is ${intro.state.replace("_", " ")} cannot become ${to.replace("_", " ")}.`);
-  const now = Date.now();
-  await ctx.db.patch(introductions, intro.id, { ...patch, state: to, updatedAt: now });
-  await ctx.db.insert(introductionEvents, { introductionId: intro.id, from: intro.state, to, actorId: me(ctx).id, seq: await ctx.db.sequence(`intro:${intro.id}`), at: now });
-  await audit(ctx, intro.ownerId, `introduction.${to}`, "introduction", intro.id);
-}
-
-async function profileOf(ctx: any, userId: string) {
-  return (await ctx.db.find(profiles, { ownerId: userId }))[0] ?? null;
-}
 
 function activeGrant(grants: Array<{ grantorId: string; granteeId: string; revokedAt?: number; expiresAt: number; fields: Field[] }>, grantorId: string, granteeId: string, now: number) {
   return grants.find((g) => g.grantorId === grantorId && g.granteeId === granteeId && !g.revokedAt && g.expiresAt > now) ?? null;
@@ -83,13 +49,13 @@ export const draft = app.mutation({
     const ownerId = me(ctx).id;
     const m = await owned<{ ownerId: string; briefId: string; personId: string; decision: string }>(ctx, matches, matchId, "match");
     if (m.decision === "rejected") fail("FAILED_PRECONDITION", "You rejected this match. Change the decision before drafting an introduction.");
-    const open = (await ctx.db.find(introductions, { matchId })).find((i) => ["draft", "consent_requested", "manual_ready", "introduced"].includes(i.state));
+    const open = (await ctx.db.find(introductions, { matchId })).find((i) => ["draft", "approved", "consent_requested", "manual_ready", "introduced", "external_sent"].includes(i.state));
     if (open) return open.id;
 
     const brief = await owned<Brief>(ctx, briefs, m.briefId, "brief");
     const person = await owned<{ ownerId: string; name: string; organization?: string; linkedUserId?: string }>(ctx, people, m.personId, "person");
     const ev = await currentEvidence(ctx, ownerId, person.id);
-    if (brief.confidential && isExcluded({ personId: person.id, name: person.name, ...(person.organization ? { organization: person.organization } : {}), relationshipState: "unknown", evidence: ev }, brief)) {
+    if (brief.confidential && isExcluded({ personId: person.id, ...(person.organization ? { organization: person.organization } : {}), evidence: ev }, brief)) {
       fail("FAILED_PRECONDITION", "This person is excluded by your confidential search.");
     }
     const mine = await profileOf(ctx, ownerId);
@@ -139,58 +105,116 @@ export const edit = app.mutation({
   args: { id: s.string(), sharedContext: s.string({ minLength: 1, maxLength: 2000 }), message: s.string({ minLength: 1, maxLength: 4000 }), requesterFields: s.array(s.enum(SHAREABLE_FIELDS)) },
   handler: async (ctx, { id, sharedContext, message, requesterFields }) => {
     const intro = await owned<Intro>(ctx, introductions, id, "introduction");
-    if (intro.state !== "draft") fail("FAILED_PRECONDITION", "Only a draft can be edited.");
+    if (intro.state !== "draft") fail("FAILED_PRECONDITION", "Only a draft can be edited. Withdraw it and draft again to change approved text.");
     await ctx.db.patch(introductions, id, { sharedContext: sharedContext.trim(), message: message.trim(), requesterFields: [...new Set(requesterFields)], updatedAt: Date.now() });
     await audit(ctx, intro.ownerId, "introduction.edited", "introduction", id);
   },
 });
 
 /**
- * The owner approves the exact draft they previewed (`version`). Checks, in order: the preview is
- * current, the recipient has not blocked the owner, the daily request limit, a confidential brief's
- * exclusions, and the outbound disclosure scan. Approving twice is a no-op, not a second request.
+ * A person approves the exact content they reviewed, for one channel. `contentHash` is the hash the
+ * review screen showed (introductions:get → channels[].hash); it covers the text, the fields the
+ * requester will share, the channel and the recipient. If anything changed since, approval is
+ * refused. The approval record keeps that content, recipient, channel and an expiry.
+ *
+ * Then, by channel:
+ * - in_app:   a delivery is queued and dispatched after commit by the job "deliveries.dispatch",
+ *             which re-validates the approval before the request becomes visible to the recipient.
+ * - external: nothing is sent yet. The person sends it (deliveries:prepareExternal, then the
+ *             `delivery.send` integration capability), which needs the delivery.send permission.
+ * - manual:   the person must send it themselves (state manual_action_required).
+ *
+ * Approving the same content again while its delivery is in progress is a no-op.
  */
 export const approve = app.mutation({
   access: "connector.execute",
   approval: "required",
   retry: { sequenceConflicts: 3 },
-  args: { id: s.string(), version: s.number() },
-  returns: s.object({ state: s.string(), alreadyApplied: s.boolean() }),
-  handler: async (ctx, { id, version }) => {
-    const ownerId = me(ctx).id;
+  args: { id: s.string(), channel: s.enum(DELIVERY_CHANNELS), contentHash: s.string() },
+  returns: s.object({ state: s.string(), status: s.string(), approvalId: s.string(), deliveryId: s.nullable(s.string()), alreadyApplied: s.boolean() }),
+  handler: async (ctx, { id, channel, contentHash }) => {
+    const actor = me(ctx);
+    if (actor.type !== "user") fail("FORBIDDEN", "Only a person can approve an introduction.");
+    const ownerId = actor.id;
     const intro = await owned<Intro>(ctx, introductions, id, "introduction");
-    if (intro.state === "consent_requested" || intro.state === "manual_ready") return { state: intro.state, alreadyApplied: true };
-    if (intro.state !== "draft") fail("FAILED_PRECONDITION", `This introduction is ${intro.state}; only a draft can be approved.`);
-    if (intro.__version !== version) fail("FAILED_PRECONDITION", "The draft changed after you reviewed it. Review the current text and approve again.");
+    const { reviewable, hash, email } = await reviewFor(ctx, intro, channel);
+
+    // Idempotent: the same content, already approved for the same channel, with its delivery in progress or done.
+    if (intro.state !== "draft" && intro.approvalId) {
+      const prior = await ctx.db.get(approvals, intro.approvalId);
+      const latest = await currentDelivery(ctx, intro);
+      const settledBad = !latest || latest.state === "failed";
+      const expired = prior && prior.expiresAt <= Date.now() && !prior.consumedAt;
+      if (prior && prior.contentHash === contentHash && prior.channel === channel && !(intro.state === "approved" && (settledBad || expired))) {
+        return { state: intro.state, status: displayStatus(intro, latest), approvalId: prior.id, deliveryId: latest?.id ?? null, alreadyApplied: true };
+      }
+    }
+    if (intro.state !== "draft" && intro.state !== "approved") fail("FAILED_PRECONDITION", `This introduction is ${intro.state.replace("_", " ")}; it cannot be approved again.`);
+    if (intro.state === "approved") {
+      const latest = await currentDelivery(ctx, intro);
+      if (latest && (latest.state === "queued" || latest.state === "unknown")) fail("FAILED_PRECONDITION", `A delivery is ${latest.state}. ${latest.state === "unknown" ? "Its outcome must be settled before anything is approved again; it is never resent automatically." : "Wait for it to finish."}`);
+    }
+    if (contentHash !== hash) fail("FAILED_PRECONDITION", "The content, recipient or channel changed after you reviewed it. Review the current text and approve again.");
+
+    const person = await ctx.db.get(people, intro.personId);
+    const options = channelOptions({ participant: Boolean(intro.recipientUserId), hasEmail: Boolean(email), mayDeliverExternally: ctx.auth.has("delivery.send") });
+    const option = options.find((o) => o.channel === channel);
+    if (!option) fail("FAILED_PRECONDITION", `The ${channel.replace("_", "-")} channel does not apply to this introduction.`);
+    if (!option.available) fail("FORBIDDEN", option.reason ?? `The ${channel} channel is not available.`);
 
     const brief = await owned<Brief>(ctx, briefs, intro.briefId, "brief");
-    const person = await ctx.db.get(people, intro.personId);
     const ev = await currentEvidence(ctx, ownerId, intro.personId);
-    if (brief.confidential && person && isExcluded({ personId: person.id, name: person.name, ...(person.organization ? { organization: person.organization } : {}), relationshipState: "unknown", evidence: ev }, brief)) {
+    if (brief.confidential && person && isExcluded({ personId: person.id, ...(person.organization ? { organization: person.organization } : {}), evidence: ev }, brief)) {
       fail("FAILED_PRECONDITION", "This person is excluded by your confidential search.");
     }
     const mine = await profileOf(ctx, ownerId);
     const allowed = intro.requesterFields.includes("email") && mine?.email ? [mine.email] : [];
     const issues = scanDisclosure({ text: `${intro.sharedContext}\n${intro.message}`, allowed, excludedOrganizations: brief.excludedOrganizations, confidential: brief.confidential });
-    if (issues.length) fail("FAILED_PRECONDITION", `Not sent. ${issues.join(" ")}`, { issues });
+    if (issues.length) fail("FAILED_PRECONDITION", `Not approved. ${issues.join(" ")}`, { issues });
 
     const now = Date.now();
-    const current = await relationshipState(ctx, intro.ownerId, intro.personId);
-    if (intro.path === "manual" && (current === "unknown" || current === "observed")) {
-      await move(ctx, intro, "manual_ready");
-      return { state: "manual_ready", alreadyApplied: false };
+    if (channel === "in_app") {
+      if ((await ctx.db.find(blocks, { blockerId: intro.recipientUserId!, blockedId: ownerId })).length) fail("FAILED_PRECONDITION", "This person is not accepting introduction requests from you.");
+    }
+    if (channel !== "manual") {
+      const recent = (await ctx.db.find(approvals, { ownerId })).filter((a) => a.channel !== "manual" && a.approvedAt > now - 24 * 60 * 60 * 1000).length;
+      if (recent >= DAILY_REQUEST_LIMIT) fail("FAILED_PRECONDITION", `You have approved ${DAILY_REQUEST_LIMIT} requests in the last 24 hours. Try again later.`);
     }
 
-    const recipient = intro.recipientUserId!;
-    if ((await ctx.db.find(blocks, { blockerId: recipient, blockedId: ownerId })).length) fail("FAILED_PRECONDITION", "This person is not accepting introduction requests from you.");
-    const recent = (await ctx.db.find(introductions, { ownerId })).filter((i) => (i.requestedAt ?? 0) > now - 24 * 60 * 60 * 1000).length;
-    if (recent >= DAILY_REQUEST_LIMIT) fail("FAILED_PRECONDITION", `You have sent ${DAILY_REQUEST_LIMIT} requests in the last 24 hours. Try again later.`);
+    // Replace any earlier approval: only one is ever in force.
+    for (const a of await ctx.db.find(approvals, { introductionId: id })) if (!a.supersededAt && !a.consumedAt) await ctx.db.patch(approvals, a.id, { supersededAt: now });
+    const approvalId = await ctx.db.insert(approvals, {
+      ownerId,
+      introductionId: id,
+      approverId: actor.id,
+      approverType: actor.type,
+      channel,
+      recipient: reviewable.recipient,
+      sharedContext: reviewable.sharedContext,
+      message: reviewable.message,
+      requesterFields: reviewable.requesterFields,
+      contentHash: hash,
+      approvedAt: now,
+      expiresAt: now + APPROVAL_TTL_MS,
+    });
+    await audit(ctx, ownerId, "introduction.content_approved", "introduction", id, { approvalId, channel, expiresAt: now + APPROVAL_TTL_MS });
+    if (intro.state === "draft") await move(ctx, intro, "approved", { channel, approvalId });
+    else await ctx.db.patch(introductions, id, { channel, approvalId, updatedAt: now });
+    intro.approvalId = approvalId;
 
-    // The owner's side of the double opt-in: what they agree to disclose if the recipient accepts.
-    await ctx.db.insert(consentGrants, { grantorId: ownerId, granteeId: recipient, introductionId: id, purpose: `Introduction ${id}`, fields: intro.requesterFields, channel: "in_app", expiresAt: now + GRANT_TTL_MS, createdAt: now });
-    await move(ctx, intro, "consent_requested", { requestedAt: now, expiresAt: now + REQUEST_TTL_MS });
-    ctx.afterCommit.notifications.send({ recipient, type: "introduction.requested", title: `${mine?.displayName ?? ownerId} asked to be introduced`, data: { introductionId: id }, idempotencyKey: `${intro.idempotencyKey}:requested` });
-    return { state: "consent_requested", alreadyApplied: false };
+    let deliveryId: string | null = null;
+    if (channel === "in_app") {
+      deliveryId = await ctx.db.insert(deliveries, { ownerId, introductionId: id, approvalId, channel, provider: "in_app", state: "queued", idempotencyKey: `${intro.idempotencyKey}:${approvalId}`, createdAt: now, updatedAt: now });
+      await audit(ctx, ownerId, "delivery.queued", "delivery", deliveryId, { channel, provider: "in_app" });
+      ctx.afterCommit.jobs.enqueue("deliveries.dispatch", { deliveryId });
+    } else if (channel === "manual") {
+      deliveryId = await ctx.db.insert(deliveries, { ownerId, introductionId: id, approvalId, channel, provider: "manual", state: "manual_action_required", reason: "No provider was used. Copy the approved text, send it yourself, then record that you did.", idempotencyKey: `${intro.idempotencyKey}:${approvalId}`, createdAt: now, updatedAt: now });
+      await ctx.db.patch(approvals, approvalId, { consumedAt: now });
+      await audit(ctx, ownerId, "delivery.manual_action_required", "delivery", deliveryId, { channel });
+      await move(ctx, intro, "manual_ready");
+    }
+    const latest = deliveryId ? await ctx.db.get(deliveries, deliveryId) : null;
+    return { state: intro.state, status: displayStatus(intro, latest), approvalId, deliveryId, alreadyApplied: false };
   },
 });
 
@@ -201,9 +225,15 @@ export const markSent = app.mutation({
   retry: { sequenceConflicts: 3 },
   args: { id: s.string() },
   handler: async (ctx, { id }) => {
+    if (me(ctx).type !== "user") fail("FORBIDDEN", "Only a person can record a manual send.");
     const intro = await owned<Intro>(ctx, introductions, id, "introduction");
     if (intro.state === "manual_sent") return;
     await move(ctx, intro, "manual_sent", { requestedAt: Date.now() });
+    const latest = await currentDelivery(ctx, intro);
+    if (latest && latest.state === "manual_action_required") {
+      await ctx.db.patch(deliveries, latest.id, { state: "sent", determinedBy: "person", reason: "Recorded as sent by you; the app did not deliver it.", updatedAt: Date.now() });
+      await audit(ctx, intro.ownerId, "delivery.sent", "delivery", latest.id, { channel: "manual", determinedBy: "person" });
+    }
   },
 });
 
@@ -214,8 +244,14 @@ export const withdraw = app.mutation({
   handler: async (ctx, { id }) => {
     const intro = await owned<Intro>(ctx, introductions, id, "introduction");
     if (intro.state === "withdrawn") return;
+    const latest = await currentDelivery(ctx, intro);
+    if (latest && latest.channel === "external" && (latest.state === "queued" || latest.state === "unknown")) {
+      fail("FAILED_PRECONDITION", `An external delivery is ${latest.state}; withdrawing would not stop it. Settle its outcome first.`);
+    }
     await move(ctx, intro, "withdrawn");
-    for (const g of await ctx.db.find(consentGrants, { introductionId: id, grantorId: intro.ownerId })) if (!g.revokedAt) await ctx.db.patch(consentGrants, g.id, { revokedAt: Date.now() });
+    const now = Date.now();
+    for (const g of await ctx.db.find(consentGrants, { introductionId: id, grantorId: intro.ownerId })) if (!g.revokedAt) await ctx.db.patch(consentGrants, g.id, { revokedAt: now });
+    for (const a of await ctx.db.find(approvals, { introductionId: id })) if (!a.supersededAt && !a.consumedAt) await ctx.db.patch(approvals, a.id, { supersededAt: now });
   },
 });
 
@@ -268,7 +304,7 @@ export const respond = app.mutation({
   handler: async (ctx, { id, accept, fields, block }) => {
     const userId = me(ctx).id;
     const intro = (await ctx.db.get(introductions, id)) as Intro | null;
-    if (!intro || intro.recipientUserId !== userId || intro.state === "draft") fail("NOT_FOUND", `No introduction request ${id}.`);
+    if (!intro || intro.recipientUserId !== userId || intro.requestedAt === undefined) fail("NOT_FOUND", `No introduction request ${id}.`);
     if ((accept && intro.state === "introduced") || (!accept && intro.state === "declined")) return { state: intro.state };
     if (intro.state === "consent_requested" && intro.expiresAt && intro.expiresAt < Date.now()) {
       await move(ctx, intro, "expired");
@@ -341,7 +377,12 @@ export const outgoing = app.query({
   handler: async (ctx) => {
     const ownerId = me(ctx).id;
     const all = (await ctx.db.find(introductions, { ownerId }, { orderBy: [{ field: "updatedAt", direction: "desc" }] })) as Intro[];
-    return Promise.all(all.map(async (i) => ({ id: i.id, state: i.state, path: i.path, personId: i.personId, personName: (await ctx.db.get(people, i.personId))?.name ?? "(deleted)", briefId: i.briefId, followUpAt: i.followUpAt ?? null, updatedAt: i.updatedAt, expiresAt: i.expiresAt ?? null })));
+    return Promise.all(
+      all.map(async (i) => {
+        const latest = await currentDelivery(ctx, i);
+        return { id: i.id, state: i.state, status: displayStatus(i, latest), channel: i.channel ?? null, path: i.path, personId: i.personId, personName: (await ctx.db.get(people, i.personId))?.name ?? "(deleted)", briefId: i.briefId, followUpAt: i.followUpAt ?? null, updatedAt: i.updatedAt, expiresAt: i.expiresAt ?? null };
+      }),
+    );
   },
 });
 
@@ -350,14 +391,19 @@ export const incoming = app.query({
   access: "connector.read",
   handler: async (ctx) => {
     const userId = me(ctx).id;
-    const all = ((await ctx.db.find(introductions, { recipientUserId: userId })) as Intro[]).filter((i) => i.state !== "draft").sort((a, b) => b.updatedAt - a.updatedAt);
+    // A request exists for its recipient only once it was delivered (requestedAt is set by the in-app dispatch).
+    const all = ((await ctx.db.find(introductions, { recipientUserId: userId })) as Intro[]).filter((i) => i.requestedAt !== undefined).sort((a, b) => b.updatedAt - a.updatedAt);
     return Promise.all(
       all.map(async (i) => ({ id: i.id, state: i.state, from: (await profileOf(ctx, i.ownerId))?.displayName ?? i.ownerId, sharedContext: i.sharedContext, message: i.message, expiresAt: i.expiresAt ?? null, disclosed: await disclosed(ctx, i, i.ownerId, userId), myConsentActive: Boolean(activeGrant(await ctx.db.find(consentGrants, { introductionId: i.id }), userId, i.ownerId, Date.now())) })),
     );
   },
 });
 
-/** The owner's full view of one introduction: the exact text, its history, and what has been disclosed to them. */
+/**
+ * The owner's full view of one introduction: the exact text, the channels it may use with the hash
+ * of what would be approved for each, the approval in force, every delivery attempt with its
+ * provider outcome, its history, and what has been disclosed to them.
+ */
 export const get = app.query({
   access: "connector.read",
   args: { id: s.string() },
@@ -366,9 +412,18 @@ export const get = app.query({
     const person = await ctx.db.get(people, intro.personId);
     const events = await ctx.db.find(introductionEvents, { introductionId: id }, { orderBy: [{ field: "seq", direction: "asc" }] });
     const grants = await ctx.db.find(consentGrants, { introductionId: id });
+    const options = channelOptions({ participant: Boolean(intro.recipientUserId), hasEmail: Boolean(person?.email), mayDeliverExternally: ctx.auth.has("delivery.send") });
+    const channels = await Promise.all(options.map(async (o) => ({ ...o, hash: (await reviewFor(ctx, intro, o.channel)).hash })));
+    const approval = intro.approvalId ? await ctx.db.get(approvals, intro.approvalId) : null;
+    const attempts = (await ctx.db.find(deliveries, { introductionId: id })).sort((a, b) => b.createdAt - a.createdAt);
+    const latest = await currentDelivery(ctx, intro);
     return {
       ...intro,
       personName: person?.name ?? "(deleted)",
+      status: displayStatus(intro, latest),
+      channels,
+      approval: approval ? { id: approval.id, channel: approval.channel, recipient: approval.recipient.startsWith("email:") ? "external address on file" : approval.recipient, contentHash: approval.contentHash, approvedAt: approval.approvedAt, expiresAt: approval.expiresAt, consumedAt: approval.consumedAt ?? null, expired: approval.expiresAt <= Date.now() && !approval.consumedAt } : null,
+      deliveries: attempts.map((d) => ({ id: d.id, channel: d.channel, provider: d.provider, state: d.state, reason: d.reason ?? null, providerStatus: d.providerStatus ?? null, providerCode: d.providerCode ?? null, determinedBy: d.determinedBy ?? null, contentMismatch: d.contentMismatch ?? false, idempotencyKey: d.idempotencyKey, createdAt: d.createdAt, updatedAt: d.updatedAt })),
       events,
       disclosed: intro.recipientUserId ? await disclosed(ctx, intro, intro.recipientUserId, intro.ownerId) : {},
       myConsentActive: Boolean(intro.recipientUserId && activeGrant(grants, intro.ownerId, intro.recipientUserId, Date.now())),

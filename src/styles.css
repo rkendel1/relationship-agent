@@ -206,3 +206,18 @@ details summary { cursor: pointer; }
   .card-head { flex-direction: column; }
   .table { display: block; overflow-x: auto; }
 }
+
+/* Delivery status and match strength */
+.s-draft, .s-approved, .s-queued { background: var(--warn-soft); color: var(--warn); }
+.s-sent { background: var(--accent-soft); color: var(--accent); }
+.s-failed, .s-declined, .s-withdrawn, .s-expired { background: var(--danger-soft); color: var(--danger); }
+.s-unknown, .s-manual_action_required { background: light-dark(#fff1e0, #33210d); color: light-dark(#b45309, #fdba74); }
+.m-strong { background: var(--accent-soft); color: var(--accent); }
+.m-moderate { background: light-dark(#e0ecff, #172238); color: light-dark(#1d4ed8, #93c5fd); }
+.m-weak { background: light-dark(#eef0ee, #23282a); color: var(--muted); }
+.delivery-note { border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+.delivery-note.info { background: var(--accent-soft); color: var(--accent); }
+.delivery-note.warn { background: light-dark(#fff1e0, #33210d); color: light-dark(#b45309, #fdba74); }
+.delivery-note.error { background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger-line); }
+.table tr.muted td { color: var(--muted); }
+details .table { margin-top: 8px; font-size: 13px; }

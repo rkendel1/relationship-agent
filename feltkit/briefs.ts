@@ -1,11 +1,15 @@
 import { fail, s } from "@feltdb/feltkit";
-import { app, blocks, briefs, evidence, matches, OPPORTUNITY_TYPES, people, profiles } from "./app.js";
+import { aliases, app, blocks, briefs, evidence, matches, OPPORTUNITY_TYPES, people, profiles, relationshipEvents } from "./app.js";
 import { audit, currentEvidence, ensureSource, me, owned, relationshipState, transitionRelationship, visiblePeople } from "./_access.js";
 import { interpretBrief, INTERPRETER } from "./_intent.js";
-import { isExcluded, scoreCandidates, type Candidate } from "./_rules.js";
-import { normalizeTopics, overlap } from "./_text.js";
+import { isExcluded, NEED_TYPES, scoreCandidates, type Alias, type MatchCandidate } from "./_match.js";
+import { normalizeTopics } from "./_text.js";
 
-type Brief = { id: string; __version: number; ownerId: string; status: "draft" | "confirmed" | "archived"; topics: string[]; geography?: string; confidential: boolean; excludedOrganizations: string[]; excludedPersonIds: string[] };
+type Brief = { id: string; __version: number; ownerId: string; status: "draft" | "confirmed" | "archived"; opportunityType: (typeof OPPORTUNITY_TYPES)[number]; target: string; topics: string[]; geography?: string; confidential: boolean; excludedOrganizations: string[]; excludedPersonIds: string[] };
+
+async function ownerAliases(ctx: any, ownerId: string): Promise<Alias[]> {
+  return (await ctx.db.find(aliases, { ownerId })).map((a: { id: string; term: string; equivalents: string[] }) => ({ id: a.id, term: a.term, equivalents: a.equivalents }));
+}
 
 export const list = app.query({
   access: "connector.read",
@@ -108,32 +112,38 @@ export const archive = app.mutation({
  * graph, as people with evidence of what they said about themselves. Contact details are not
  * copied: they are disclosed only through an introduction's consent grants.
  */
-async function discoverParticipants(ctx: any, ownerId: string, brief: Brief): Promise<void> {
+async function discoverParticipants(ctx: any, ownerId: string, brief: Brief, declared: Alias[]): Promise<void> {
   const open = (await ctx.db.find(profiles, { openToIntroductions: true })).filter((p: { ownerId: string }) => p.ownerId !== ownerId);
   if (!open.length) return;
   const blockedBy = new Set((await ctx.db.find(blocks, { blockedId: ownerId })).map((b: { blockerId: string }) => b.blockerId));
   const mine = await ctx.db.find(people, { ownerId });
+  const now = Date.now();
   for (const profile of open) {
     if (blockedBy.has(profile.ownerId)) continue;
-    const offered = [...profile.introTopics, ...profile.expertise];
-    if (!overlap(brief.topics, offered).length) continue;
-    const claim = `${profile.headline ? `${profile.headline}. ` : ""}Open to introductions about: ${profile.introTopics.join(", ") || "(none listed)"}. Expertise: ${profile.expertise.join(", ") || "(none listed)"}.`;
+    const offered = [...new Set([...profile.introTopics, ...profile.expertise])];
+    // Needs are matched only when the participant made them visible, and only for searches where a need is a fit.
+    const needTopics = profile.needsVisible && NEED_TYPES.includes(brief.opportunityType) ? normalizeTopics(profile.needs) : [];
+    const claim = `${profile.headline ? `${profile.headline}. ` : ""}Open to introductions about: ${profile.introTopics.join(", ") || "(none listed)"}. Expertise: ${profile.expertise.join(", ") || "(none listed)"}.${needTopics.length ? ` Looking for: ${profile.needs.join("; ")}.` : ""}`;
+    // Discovery uses the same scorer as matching: a participant is brought in only if their own
+    // statement would match this brief. Free text is not used for discovery, only declared terms.
+    const provisional: MatchCandidate = { personId: profile.ownerId, name: profile.displayName, relationshipState: "unknown", evidence: [{ id: "provisional", sourceType: "participant_statement", claim: "", topics: offered, needTopics, confidence: 0.9, capturedAt: now }] };
+    if (!scoreCandidates({ ...brief, target: "" }, [provisional], declared, now).length) continue;
     // A confidential brief must not create a record of anyone tied to an excluded organization.
-    if (isExcluded({ personId: "", name: profile.displayName, relationshipState: "unknown", evidence: [{ id: "", sourceType: "participant_statement", claim, topics: [], confidence: 1, capturedAt: 0 }] }, brief)) continue;
+    if (isExcluded({ personId: "", evidence: [{ ...provisional.evidence[0]!, claim }] }, brief)) continue;
     const sourceId = await ensureSource(ctx, ownerId, "network", "Boundry network profiles");
     let person = mine.find((p: { linkedUserId?: string }) => p.linkedUserId === profile.ownerId);
     if (!person) {
-      const id = await ctx.db.insert(people, { ownerId, name: profile.displayName, linkedUserId: profile.ownerId, sourceIds: [sourceId], createdAt: Date.now() });
+      const id = await ctx.db.insert(people, { ownerId, name: profile.displayName, linkedUserId: profile.ownerId, sourceIds: [sourceId], createdAt: now });
       person = { id, sourceIds: [sourceId] };
       mine.push({ ...person, linkedUserId: profile.ownerId });
       await audit(ctx, ownerId, "person.discovered", "person", id, { via: "network" });
     } else if (!person.sourceIds.includes(sourceId)) {
       await ctx.db.patch(people, person.id, { sourceIds: [...person.sourceIds, sourceId] });
     }
-    const sourceRef = `profile:${profile.ownerId}@${profile.updatedAt}`;
+    const sourceRef = `profile:${profile.ownerId}@${profile.updatedAt}${needTopics.length ? "+needs" : ""}`;
     let evidenceId = (await ctx.db.find(evidence, { ownerId, personId: person.id, sourceRef }))[0]?.id as string | undefined;
     if (!evidenceId) {
-      evidenceId = await ctx.db.insert(evidence, { ownerId, personId: person.id, sourceId, sourceType: "participant_statement", sourceRef, claim, topics: offered, confidence: 0.9, scope: "shareable", capturedAt: Date.now(), retracted: false });
+      evidenceId = await ctx.db.insert(evidence, { ownerId, personId: person.id, sourceId, sourceType: "participant_statement", sourceRef, claim, topics: offered, ...(needTopics.length ? { needTopics } : {}), confidence: 0.9, scope: "shareable", capturedAt: now, retracted: false });
     }
     await transitionRelationship(ctx, ownerId, person.id, "introducible", "participant.optin", [evidenceId!]);
   }
@@ -141,7 +151,7 @@ async function discoverParticipants(ctx: any, ownerId: string, brief: Brief): Pr
 
 /**
  * Runs matching for a confirmed brief: deterministic retrieval over the owner's current evidence
- * and opted-in participants, scored by _rules.ts. Earlier decisions (accepted, rejected, deferred)
+ * and opted-in participants, scored by _match.ts. Earlier decisions (accepted, rejected, deferred)
  * are kept; a rejected person is never re-proposed for this brief.
  */
 export const match = app.mutation({
@@ -154,23 +164,27 @@ export const match = app.mutation({
     const ownerId = me(ctx).id;
     const brief = await owned<Brief>(ctx, briefs, id, "brief");
     if (brief.status !== "confirmed") fail("FAILED_PRECONDITION", "Confirm the brief before matching.");
-    await discoverParticipants(ctx, ownerId, brief);
+    const declared = await ownerAliases(ctx, ownerId);
+    await discoverParticipants(ctx, ownerId, brief, declared);
 
-    const [all, ev] = await Promise.all([visiblePeople(ctx, ownerId), currentEvidence(ctx, ownerId)]);
-    const candidates: Candidate[] = await Promise.all(
+    const [all, ev, events] = await Promise.all([visiblePeople(ctx, ownerId), currentEvidence(ctx, ownerId), ctx.db.find(relationshipEvents, { ownerId })]);
+    const latestEvent = new Map<string, { id: string; seq: number }>();
+    for (const e of events) if ((latestEvent.get(e.personId)?.seq ?? -1) < e.seq) latestEvent.set(e.personId, { id: e.id, seq: e.seq });
+    const candidates: MatchCandidate[] = await Promise.all(
       all.map(async (p) => ({
         personId: p.id,
         name: p.name,
         ...(p.organization ? { organization: p.organization } : {}),
         relationshipState: await relationshipState(ctx, ownerId, p.id),
+        ...(latestEvent.has(p.id) ? { relationshipEventId: latestEvent.get(p.id)!.id } : {}),
         evidence: ev.filter((e) => e.personId === p.id),
       })),
     );
-    const scored = scoreCandidates(brief, candidates, Date.now()).slice(0, 25);
+    const scored = scoreCandidates(brief, candidates, declared, Date.now()).slice(0, 25);
     const existing = new Map((await ctx.db.find(matches, { briefId: id })).map((m) => [m.personId, m]));
     for (const m of scored) {
       const prior = existing.get(m.personId);
-      if (prior) await ctx.db.patch(matches, prior.id, { score: m.score, reasons: m.reasons, unknowns: m.unknowns, relationshipState: m.relationshipState });
+      if (prior) await ctx.db.patch(matches, prior.id, { score: m.score, strength: m.strength, contributions: m.contributions, reasons: m.reasons, unknowns: m.unknowns, relationshipState: m.relationshipState });
       else await ctx.db.insert(matches, { ownerId, briefId: id, ...m, decision: "pending", createdAt: Date.now() });
     }
     await ctx.db.patch(briefs, id, { matchedAt: Date.now() });
