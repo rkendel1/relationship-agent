@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.feltkit/
+.feltkit-platform/
+# Credentials and local deployment state: environment files (FELTKIT_*, FELTDB_* keys), and what
+# `feltdb init-managed` / `feltdb managed keys` write if this app later moves to Managed FeltDB.
+# Never commit.
+.env
+.env.*
+!.env.example
+.feltdb/
+*.app/
