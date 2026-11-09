@@ -7,76 +7,10 @@ import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "re
 import { useMutation, useQueryState } from "@feltdb/feltkit/react";
 import { api } from "../feltkit/_generated/api";
 
-type Props = { onError: (e: unknown) => void; onInfo: (text: string) => void };
-type View = "ask" | "people" | "intros" | "requests" | "profile" | "privacy";
+import { Badge, Empty, fmt, fmtDate, splitList, STATE_HELP, STATE_LABEL, useAction, type Props } from "./ui";
+import { IntrosView, ReadinessView } from "./Delivery";
 
-const STATE_LABEL: Record<string, string> = {
-  unknown: "Unknown",
-  observed: "Observed",
-  known: "Known",
-  connected: "Connected",
-  introducible: "Introducible",
-  introduced: "Introduced",
-  active: "Active",
-};
-const STATE_HELP: Record<string, string> = {
-  unknown: "Referenced, with no relationship evidence.",
-  observed: "Seen in an authorized source. You have not said you know them.",
-  known: "You said you have interacted with them.",
-  connected: "You said you are connected. That does not imply they will make introductions.",
-  introducible: "They opted in to receive relevant introduction requests.",
-  introduced: "Both sides opted in and the introduction was made.",
-  active: "You recorded an ongoing interaction.",
-};
-const INTRO_LABEL: Record<string, string> = {
-  draft: "Draft",
-  consent_requested: "Awaiting their answer",
-  introduced: "Introduced",
-  completed: "Completed",
-  declined: "Declined",
-  withdrawn: "Withdrawn",
-  expired: "Expired",
-  manual_ready: "Approved — send it yourself",
-  manual_sent: "Sent by you",
-};
-
-const fmt = (ms: number | null | undefined) => (ms ? new Date(ms).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "");
-const fmtDate = (ms: number | null | undefined) => (ms ? new Date(ms).toLocaleDateString(undefined, { dateStyle: "medium" }) : "");
-const splitList = (s: string) => s.split(/[,;\n]/).map((x) => x.trim()).filter(Boolean);
-
-function useAction(onError: (e: unknown) => void) {
-  const [busy, setBusy] = useState(false);
-  const run = async <T,>(fn: () => Promise<T>): Promise<T | undefined> => {
-    setBusy(true);
-    try {
-      return await fn();
-    } catch (e) {
-      onError(e);
-      return undefined;
-    } finally {
-      setBusy(false);
-    }
-  };
-  return { busy, run };
-}
-
-function Badge({ state, kind = "rel" }: { state: string; kind?: "rel" | "intro" }) {
-  const label = kind === "rel" ? STATE_LABEL[state] ?? state : INTRO_LABEL[state] ?? state;
-  return (
-    <span className={`badge b-${state}`} title={kind === "rel" ? STATE_HELP[state] : undefined}>
-      {label}
-    </span>
-  );
-}
-
-function Empty({ title, children }: { title: string; children?: ReactNode }) {
-  return (
-    <div className="empty small">
-      <h2>{title}</h2>
-      {children && <p className="muted">{children}</p>}
-    </div>
-  );
-}
+type View = "ask" | "people" | "intros" | "requests" | "delivery" | "profile" | "privacy";
 
 export function Workspace(props: Props) {
   const [view, setView] = useState<View>("ask");
@@ -89,6 +23,7 @@ export function Workspace(props: Props) {
     ["people", "People"],
     ["intros", "Introductions"],
     ["requests", "Requests", pending ? <span className="count pill">{pending}</span> : null],
+    ["delivery", "Delivery"],
     ["profile", "Profile"],
     ["privacy", "Privacy & audit"],
   ];
@@ -115,6 +50,7 @@ export function Workspace(props: Props) {
         {view === "people" && <PeopleView {...props} initial={focus.person} />}
         {view === "intros" && <IntrosView {...props} initial={focus.intro} />}
         {view === "requests" && <RequestsView {...props} />}
+        {view === "delivery" && <ReadinessView {...props} />}
         {view === "profile" && <ProfileView {...props} />}
         {view === "privacy" && <PrivacyView {...props} />}
       </main>
@@ -331,6 +267,7 @@ function MatchList({ briefId, onError, onInfo, openIntro, openPerson }: Props & 
               <button className="link strong" onClick={() => openPerson(m.personId)}>{m.name}</button>
               <span className="muted">{[m.title, m.organization].filter(Boolean).join(" · ")}</span>
               {m.participant && <span className="badge b-participant">Network member</span>}
+              {m.strength && <span className={`badge m-${m.strength}`} title="Strong: most explicit topics are evidenced by specific terms. Weak: only generic or incidental terms matched.">{m.strength} match</span>}
             </div>
             <div className="row">
               <Badge state={m.relationshipState} />
@@ -351,6 +288,30 @@ function MatchList({ briefId, onError, onInfo, openIntro, openPerson }: Props & 
                 <li key={u}>{u}</li>
               ))}
             </ul>
+          )}
+          {m.contributions.length > 0 && (
+            <details>
+              <summary className="small-text muted">How the score was computed</summary>
+              <table className="table">
+                <thead>
+                  <tr><th>Brief term</th><th>Found as</th><th>Where</th><th>Evidence</th><th>Confidence</th><th>Freshness</th><th>Points</th></tr>
+                </thead>
+                <tbody>
+                  {m.contributions.map((k, i) => (
+                    <tr key={i} className={k.counted ? "" : "muted"}>
+                      <td>{k.briefTerm}{k.termKind === "context" ? " (context)" : ""}{k.lowSignal ? " · generic" : ""}</td>
+                      <td>{k.matchedWord}{k.aliasId ? " (alias)" : ""}</td>
+                      <td>{k.field}</td>
+                      <td>{m.evidence.find((e) => e.id === k.evidenceId)?.sourceType.replace("_", " ") ?? k.evidenceId}</td>
+                      <td>{Math.round(k.confidence * 100)}%</td>
+                      <td>{k.freshness}</td>
+                      <td>{k.counted ? k.points.toFixed(3) : `(${k.points.toFixed(3)})`}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="small-text muted">Only the strongest finding per term counts (others in parentheses). Score = counted points ÷ total term weight + relationship bonus.</p>
+            </details>
           )}
           <details>
             <summary className="small-text muted">Evidence ({m.evidence.length})</summary>
@@ -392,186 +353,6 @@ function MatchList({ briefId, onError, onInfo, openIntro, openPerson }: Props & 
 
 // ---------------------------------------------------------------------------------------------
 // Introductions (outgoing)
-
-function IntrosView(props: Props & { initial?: string }) {
-  const intros = useQueryState(api.introductions.outgoing);
-  const expire = useMutation(api.introductions.expireDue);
-  const [selected, setSelected] = useState<string | undefined>(props.initial);
-  const list = intros.data ?? [];
-  const current = selected ?? list[0]?.id;
-  useEffect(() => {
-    void expire({}).catch(() => undefined);
-  }, [expire]);
-  const followUps = list.filter((i) => i.followUpAt && i.followUpAt <= Date.now() + 86400000);
-  return (
-    <div className="stack gap">
-      <h1>Introductions</h1>
-      {followUps.length > 0 && (
-        <div className="notice info">Follow up due: {followUps.map((f) => f.personName).join(", ")}</div>
-      )}
-      {list.length === 0 ? (
-        <Empty title="No introductions yet">Draft one from a match on the Ask screen.</Empty>
-      ) : (
-        <div className="split">
-          <ul className="list">
-            {list.map((i) => (
-              <li key={i.id}>
-                <button className={`project ${current === i.id ? "active" : ""}`} onClick={() => setSelected(i.id)}>
-                  <span className="project-name">{i.personName}</span>
-                  <Badge state={i.state} kind="intro" />
-                </button>
-              </li>
-            ))}
-          </ul>
-          {current && <IntroDetail key={current} id={current} {...props} />}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function IntroDetail({ id, onError, onInfo }: Props & { id: string }) {
-  const q = useQueryState(api.introductions.get, { id });
-  const edit = useMutation(api.introductions.edit);
-  const approve = useMutation(api.introductions.approve);
-  const markSent = useMutation(api.introductions.markSent);
-  const withdraw = useMutation(api.introductions.withdraw);
-  const complete = useMutation(api.introductions.complete);
-  const setFollowUp = useMutation(api.introductions.setFollowUp);
-  const revoke = useMutation(api.introductions.revokeConsent);
-  const { busy, run } = useAction(onError);
-  const intro = q.data;
-  const [draft, setDraft] = useState<{ sharedContext: string; message: string; fields: string[] } | null>(null);
-  const [note, setNote] = useState("");
-  useEffect(() => {
-    if (intro && intro.state === "draft") setDraft({ sharedContext: intro.sharedContext, message: intro.message, fields: intro.requesterFields });
-  }, [intro?.__version]); // eslint-disable-line react-hooks/exhaustive-deps
-  if (!intro) return <p className="muted">Loading…</p>;
-  const dirty = draft && (draft.sharedContext !== intro.sharedContext || draft.message !== intro.message || draft.fields.join() !== intro.requesterFields.join());
-
-  return (
-    <section className="card stack">
-      <div className="row-between">
-        <h2>{intro.personName}</h2>
-        <Badge state={intro.state} kind="intro" />
-      </div>
-      <p className="muted small-text">
-        {intro.path === "participant"
-          ? "They are a network member: they receive this request in the app and choose whether to accept."
-          : "No outbound connector is configured, so the app cannot deliver this. After approval, copy the text and send it yourself, then record that you did."}
-      </p>
-
-      {intro.state === "draft" && draft ? (
-        <>
-          <label className="field">
-            <span>What they will see about your request (minimum necessary)</span>
-            <textarea rows={3} value={draft.sharedContext} onChange={(e) => setDraft({ ...draft, sharedContext: e.target.value })} />
-          </label>
-          <label className="field">
-            <span>Message</span>
-            <textarea rows={5} value={draft.message} onChange={(e) => setDraft({ ...draft, message: e.target.value })} />
-          </label>
-          {intro.path === "participant" && (
-            <fieldset className="field">
-              <span>If they accept, share with them:</span>
-              {(["headline", "email"] as const).map((f) => (
-                <label key={f} className="check">
-                  <input type="checkbox" checked={draft.fields.includes(f)} onChange={(e) => setDraft({ ...draft, fields: e.target.checked ? [...draft.fields, f] : draft.fields.filter((x) => x !== f) })} /> your {f}
-                </label>
-              ))}
-            </fieldset>
-          )}
-          <div className="row-end">
-            <button className="danger-link" onClick={() => run(() => withdraw({ id }))}>Discard</button>
-            {dirty ? (
-              <button className="secondary" disabled={busy} onClick={() => run(() => edit({ id, sharedContext: draft.sharedContext, message: draft.message, requesterFields: draft.fields as Array<"email" | "headline"> }))}>
-                Save changes, then review
-              </button>
-            ) : (
-              <button
-                className="primary"
-                disabled={busy}
-                onClick={async () => {
-                  const r = await run(() => approve({ id, version: intro.__version }));
-                  if (r) onInfo(r.state === "consent_requested" ? "Request sent. Nothing about them is shared with you unless they accept." : "Approved. Copy the text and send it yourself.");
-                }}
-              >
-                {intro.path === "participant" ? "Approve and send request" : "Approve text"}
-              </button>
-            )}
-          </div>
-        </>
-      ) : (
-        <>
-          <div className="preview">
-            <div className="small-text muted">Shared context</div>
-            <p>{intro.sharedContext}</p>
-            <div className="small-text muted">Message</div>
-            <p className="pre">{intro.message}</p>
-          </div>
-          {intro.state === "manual_ready" && (
-            <div className="row-end">
-              <button className="secondary" onClick={() => void navigator.clipboard?.writeText(intro.message).then(() => onInfo("Copied."))}>Copy text</button>
-              <button className="primary" disabled={busy} onClick={() => run(() => markSent({ id }))}>I sent it</button>
-            </div>
-          )}
-        </>
-      )}
-
-      {Object.keys(intro.disclosed).length > 0 && (
-        <div className="disclosed">
-          <div className="small-text muted">Shared with you by consent</div>
-          {Object.entries(intro.disclosed).map(([k, v]) => (
-            <div key={k}>
-              <strong>{k}:</strong> {v}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {["introduced", "manual_sent"].includes(intro.state) && (
-        <div className="stack">
-          <label className="field">
-            <span>Follow up on</span>
-            <input type="date" value={intro.followUpAt ? new Date(intro.followUpAt).toISOString().slice(0, 10) : ""} onChange={(e) => run(() => setFollowUp({ id, at: e.target.value ? new Date(e.target.value).getTime() : null }))} />
-          </label>
-          <label className="field">
-            <span>What happened? (private to you)</span>
-            <textarea rows={3} value={note} onChange={(e) => setNote(e.target.value)} />
-          </label>
-          <div className="row-end">
-            <button className="primary" disabled={busy || !note.trim()} onClick={() => run(() => complete({ id, note })).then(() => setNote(""))}>Record outcome</button>
-          </div>
-        </div>
-      )}
-      {intro.outcomeNote && (
-        <div className="preview">
-          <div className="small-text muted">Outcome</div>
-          <p className="pre">{intro.outcomeNote}</p>
-        </div>
-      )}
-
-      <div className="row-end">
-        {["consent_requested", "manual_ready"].includes(intro.state) && <button className="danger-link" onClick={() => run(() => withdraw({ id }))}>Withdraw request</button>}
-        {intro.myConsentActive && ["introduced", "completed", "consent_requested"].includes(intro.state) && (
-          <button className="danger-link" onClick={() => run(() => revoke({ introductionId: id })).then((n) => n && onInfo("Your consent is withdrawn. They no longer see what you shared."))}>Withdraw my consent</button>
-        )}
-      </div>
-
-      <details>
-        <summary className="small-text muted">History · key {intro.idempotencyKey}</summary>
-        <ol className="timeline">
-          <li>{fmt(intro.createdAt)} — drafted</li>
-          {intro.events.map((e) => (
-            <li key={e.id}>
-              {fmt(e.at)} — {INTRO_LABEL[e.to] ?? e.to} <span className="muted">by {e.actorId}</span>
-            </li>
-          ))}
-        </ol>
-      </details>
-    </section>
-  );
-}
 
 // ---------------------------------------------------------------------------------------------
 // Requests (incoming)
@@ -854,7 +635,7 @@ function ProfileView({ onError, onInfo }: Props) {
   const q = useQueryState(api.profile.get);
   const save = useMutation(api.profile.save);
   const { busy, run } = useAction(onError);
-  const [f, setF] = useState<null | { displayName: string; headline: string; email: string; projects: string; expertise: string; needs: string; boundaries: string; openToIntroductions: boolean; introTopics: string }>(null);
+  const [f, setF] = useState<null | { displayName: string; headline: string; email: string; projects: string; expertise: string; needs: string; boundaries: string; openToIntroductions: boolean; introTopics: string; needsVisible: boolean }>(null);
   useEffect(() => {
     if (q.isLoading || f) return;
     const p = q.data;
@@ -868,6 +649,7 @@ function ProfileView({ onError, onInfo }: Props) {
       boundaries: p?.boundaries ?? "",
       openToIntroductions: p?.openToIntroductions ?? false,
       introTopics: p?.introTopics.join(", ") ?? "",
+      needsVisible: p?.needsVisible ?? false,
     });
   }, [q.isLoading, q.data, f]);
   if (!f) return <p className="muted">Loading…</p>;
@@ -878,7 +660,7 @@ function ProfileView({ onError, onInfo }: Props) {
       onSubmit={(e) => {
         e.preventDefault();
         void run(() =>
-          save({ displayName: f.displayName, headline: f.headline, email: f.email, projects: splitList(f.projects), expertise: splitList(f.expertise), needs: splitList(f.needs), boundaries: f.boundaries, openToIntroductions: f.openToIntroductions, introTopics: splitList(f.introTopics) }),
+          save({ displayName: f.displayName, headline: f.headline, email: f.email, projects: splitList(f.projects), expertise: splitList(f.expertise), needs: splitList(f.needs), boundaries: f.boundaries, openToIntroductions: f.openToIntroductions, introTopics: splitList(f.introTopics), needsVisible: f.needsVisible }),
         ).then(() => onInfo("Profile saved."));
       }}
     >
@@ -900,7 +682,12 @@ function ProfileView({ onError, onInfo }: Props) {
           </span>
         </label>
         <label className="field"><span>Topics you will take requests about</span><input value={f.introTopics} onChange={set("introTopics")} disabled={!f.openToIntroductions} /></label>
+        <label className="check">
+          <input type="checkbox" checked={f.needsVisible} disabled={!f.openToIntroductions} onChange={(e) => setF({ ...f, needsVisible: e.target.checked })} />
+          <span>Let customer, design-partner and collaborator searches match what you <em>need</em> (listed above). Off by default.</span>
+        </label>
       </div>
+      <AliasEditor onError={onError} />
       <div className="row-end"><button className="primary" disabled={busy}>Save profile</button></div>
     </form>
   );
@@ -976,6 +763,36 @@ function PrivacyView({ onError, onInfo }: Props) {
           ))}
         </ol>
       </section>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Aliases
+
+/** Equivalent terms the matcher may use. Only what is declared here is treated as the same word. */
+function AliasEditor({ onError }: { onError: (e: unknown) => void }) {
+  const list = useQueryState(api.aliases.list);
+  const set = useMutation(api.aliases.set);
+  const remove = useMutation(api.aliases.remove);
+  const { busy, run } = useAction(onError);
+  const [term, setTerm] = useState("");
+  const [equivalents, setEquivalents] = useState("");
+  return (
+    <div className="card stack">
+      <h2>Equivalent terms</h2>
+      <p className="small-text muted">Matching never guesses that two words mean the same. Declare it here, e.g. “databases” = “postgres, distributed storage”. Matches found through an alias count a little less and say so.</p>
+      {(list.data ?? []).map((a) => (
+        <div key={a.id} className="row-between">
+          <span><strong>{a.term}</strong> = {a.equivalents.join(", ")}</span>
+          <button type="button" className="danger-link" onClick={() => run(() => remove({ id: a.id }))}>Remove</button>
+        </div>
+      ))}
+      <div className="inline-form">
+        <input value={term} onChange={(e) => setTerm(e.target.value)} placeholder="term" aria-label="Term" />
+        <input value={equivalents} onChange={(e) => setEquivalents(e.target.value)} placeholder="equivalents, comma separated" aria-label="Equivalent terms" />
+        <button type="button" className="secondary" disabled={busy || !term.trim() || !splitList(equivalents).length} onClick={() => run(() => set({ term, equivalents: splitList(equivalents) })).then((id) => id && (setTerm(""), setEquivalents("")))}>Save</button>
+      </div>
     </div>
   );
 }
