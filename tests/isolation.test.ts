@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createTestApp } from "@feltdb/feltkit/testing";
 import { api } from "../feltkit/_generated/api.js";
+import { approveAndDeliver } from "./_helpers.js";
 
 const profile = (displayName: string, extra: Record<string, unknown> = {}) => ({ displayName, headline: "", projects: [], expertise: [], needs: [], boundaries: "", openToIntroductions: false, introTopics: [], ...extra });
 
@@ -19,7 +20,7 @@ test("one member can neither read nor change another's graph, briefs, matches or
     const [match] = await ada.query(api.matches.list, { briefId });
     const linusMatch = (await ada.query(api.matches.list, { briefId })).find((m) => m.participant)!;
     const introId = await ada.mutation(api.introductions.draft, { matchId: linusMatch.id });
-    await ada.mutation(api.introductions.approve, { id: introId, version: (await ada.query(api.introductions.get, { id: introId })).__version });
+    await approveAndDeliver(t, ada, introId);
 
     const notFound = { code: "NOT_FOUND" };
     await assert.rejects(grace.query(api.people.get, { id: personId }), notFound);
@@ -57,7 +58,7 @@ test("export returns everything; delete removes it, keeps a content-free audit t
     const [m] = await ada.query(api.matches.list, { briefId });
     const introId = await ada.mutation(api.introductions.draft, { matchId: m!.id });
     await ada.mutation(api.introductions.edit, { id: introId, sharedContext: "Ada is looking for a databases expert.", message: "Hi Linus — we haven't met.", requesterFields: ["email"] });
-    await ada.mutation(api.introductions.approve, { id: introId, version: (await ada.query(api.introductions.get, { id: introId })).__version });
+    await approveAndDeliver(t, ada, introId);
     await linus.mutation(api.introductions.respond, { id: introId, accept: true, fields: ["email"] });
     assert.deepEqual((await linus.query(api.introductions.incoming))[0]!.disclosed, { email: "ada@example.org" });
 

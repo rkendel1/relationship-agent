@@ -26,6 +26,8 @@ export const list = app.query({
         .map((r) => ({ ...r, evidenceIds: r.evidenceIds.filter((id) => evById.has(id)) }))
         .filter((r) => r.kind !== "evidence" || r.evidenceIds.length > 0);
       if (!reasons.some((r) => r.kind === "evidence")) continue;
+      // Contributions whose evidence is no longer readable no longer count, and are not shown.
+      const contributions = (m.contributions ?? []).filter((k) => evById.has(k.evidenceId));
       const cited = [...new Set(reasons.flatMap((r) => r.evidenceIds))].map((id) => {
         const e = evById.get(id)!;
         return { id: e.id, sourceType: e.sourceType, sourceRef: e.sourceRef, claim: e.claim, capturedAt: e.capturedAt, confidence: e.confidence };
@@ -38,6 +40,8 @@ export const list = app.query({
         title: person.title ?? null,
         participant: Boolean(person.linkedUserId),
         score: m.score,
+        strength: m.strength ?? null,
+        contributions,
         reasons,
         unknowns: m.unknowns,
         relationshipState: m.relationshipState,

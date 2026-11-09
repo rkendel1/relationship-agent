@@ -3,7 +3,6 @@
  * disclosure checks. No I/O; every rule here is covered by tests/rules.test.ts.
  */
 import type { EVIDENCE_SOURCE_TYPES, INTRO_STATES, RELATIONSHIP_STATES } from "./app.js";
-import { overlap, tokens, truncate } from "./_text.js";
 
 export type RelationshipState = (typeof RELATIONSHIP_STATES)[number];
 export type IntroState = (typeof INTRO_STATES)[number];
@@ -51,11 +50,14 @@ export function decideRelationshipTransition(input: { from: RelationshipState; t
 // Introduction transitions
 
 export const INTRO_TRANSITIONS: Record<IntroState, readonly IntroState[]> = {
-  draft: ["consent_requested", "manual_ready", "withdrawn"],
+  draft: ["approved", "withdrawn"],
+  // An approval chose a channel; a delivery (or the owner, on the manual path) moves it on.
+  approved: ["consent_requested", "manual_ready", "external_sent", "withdrawn"],
   consent_requested: ["introduced", "declined", "withdrawn", "expired"],
   introduced: ["completed"],
   manual_ready: ["manual_sent", "withdrawn"],
   manual_sent: ["completed"],
+  external_sent: ["completed"],
   completed: [],
   declined: [],
   withdrawn: [],
@@ -66,108 +68,8 @@ export function canMoveIntroduction(from: IntroState, to: IntroState): boolean {
   return INTRO_TRANSITIONS[from].includes(to);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Matching
-
-export const SOURCE_WEIGHT: Record<EvidenceSourceType, number> = { interaction: 1, participant_statement: 0.9, user_attested: 0.85, contact_import: 0.6, public_url: 0.7 };
-const RELATIONSHIP_BONUS: Record<RelationshipState, number> = { unknown: 0, observed: 0, known: 0.15, connected: 0.25, introducible: 0.2, introduced: 0.3, active: 0.35 };
-export const STALE_AFTER_MS = 365 * 24 * 60 * 60 * 1000;
-
-export interface CandidateEvidence {
-  id: string;
-  sourceType: EvidenceSourceType;
-  claim: string;
-  topics: string[];
-  confidence: number;
-  capturedAt: number;
-}
-
-export interface Candidate {
-  personId: string;
-  name: string;
-  organization?: string;
-  relationshipState: RelationshipState;
-  evidence: CandidateEvidence[];
-}
-
-export interface BriefForMatching {
-  topics: string[];
-  geography?: string;
-  excludedOrganizations: string[];
-  excludedPersonIds: string[];
-}
-
-export interface ScoredMatch {
-  personId: string;
-  score: number;
-  reasons: Array<{ text: string; evidenceIds: string[]; kind: "evidence" | "relationship" | "inference" }>;
-  unknowns: string[];
-  relationshipState: RelationshipState;
-}
-
-const SOURCE_LABEL: Record<EvidenceSourceType, string> = {
-  interaction: "Recorded interaction",
-  participant_statement: "Their own network profile",
-  user_attested: "Your note",
-  contact_import: "Imported contact",
-  public_url: "Public source",
-};
-
-/** Whether a candidate touches an excluded organization (by org field or anything in its evidence). */
-export function isExcluded(candidate: Candidate, brief: BriefForMatching): boolean {
-  if (brief.excludedPersonIds.includes(candidate.personId)) return true;
-  const orgs = brief.excludedOrganizations.map((o) => o.toLowerCase().trim()).filter(Boolean);
-  if (!orgs.length) return false;
-  const haystack = [candidate.organization ?? "", ...candidate.evidence.map((e) => e.claim)].join("\n").toLowerCase();
-  return orgs.some((o) => haystack.includes(o));
-}
-
-/**
- * Scores candidates against a brief. A candidate is returned only when at least one evidence
- * record shares a topic with the brief; each reason cites the evidence ids it rests on.
- */
-export function scoreCandidates(brief: BriefForMatching, candidates: Candidate[], now: number): ScoredMatch[] {
-  const out: ScoredMatch[] = [];
-  for (const c of candidates) {
-    if (isExcluded(c, brief)) continue;
-    const covered = new Set<string>();
-    const reasons: ScoredMatch["reasons"] = [];
-    let score = 0;
-    const stale: CandidateEvidence[] = [];
-    for (const e of c.evidence) {
-      const words = [...e.topics, ...tokens(e.claim)];
-      const hit = overlap(brief.topics, words);
-      if (!hit.length) continue;
-      const fresh = now - e.capturedAt <= STALE_AFTER_MS;
-      if (!fresh) stale.push(e);
-      const weight = SOURCE_WEIGHT[e.sourceType] * e.confidence * (fresh ? 1 : 0.5);
-      for (const t of hit) {
-        if (!covered.has(t)) score += weight;
-        covered.add(t);
-      }
-      reasons.push({ text: `${SOURCE_LABEL[e.sourceType]}: “${truncate(e.claim, 160)}” — matches ${hit.join(", ")}`, evidenceIds: [e.id], kind: "evidence" });
-    }
-    if (!reasons.length) continue;
-    const coverage = brief.topics.length ? covered.size / brief.topics.length : 0;
-    score = score / Math.max(1, brief.topics.length) + coverage * 0.5 + RELATIONSHIP_BONUS[c.relationshipState];
-
-    const relEvidence = c.evidence.filter((e) => e.sourceType === "user_attested" || e.sourceType === "interaction").map((e) => e.id);
-    if (c.relationshipState === "known" || c.relationshipState === "connected") reasons.push({ text: `You recorded that you are ${c.relationshipState === "known" ? "acquainted with" : "connected to"} them.`, evidenceIds: relEvidence, kind: "relationship" });
-    if (c.relationshipState === "introducible") reasons.push({ text: "They opted in to receive introduction requests on these topics.", evidenceIds: c.evidence.filter((e) => e.sourceType === "participant_statement").map((e) => e.id), kind: "relationship" });
-    if (c.relationshipState === "introduced" || c.relationshipState === "active") reasons.push({ text: "You have already been introduced.", evidenceIds: relEvidence, kind: "relationship" });
-
-    const unknowns: string[] = [];
-    const missing = brief.topics.filter((t) => !covered.has(t));
-    if (missing.length) unknowns.push(`No evidence for: ${missing.join(", ")}.`);
-    if (c.relationshipState === "unknown" || c.relationshipState === "observed") unknowns.push("No relationship evidence: this is a discovery, not a connection. Do not imply you know them.");
-    if (c.relationshipState !== "introducible") unknowns.push("Whether they are willing to help is unknown.");
-    if (brief.geography && !c.evidence.some((e) => e.claim.toLowerCase().includes(brief.geography!.toLowerCase()))) unknowns.push(`Location (${brief.geography}) is not evidenced.`);
-    for (const e of stale) unknowns.push(`Evidence ${e.id} is more than a year old and may be out of date.`);
-
-    out.push({ personId: c.personId, score: Math.round(score * 1000) / 1000, reasons, unknowns, relationshipState: c.relationshipState });
-  }
-  return out.sort((a, b) => b.score - a.score || (a.personId < b.personId ? -1 : 1));
-}
+// Matching lives in _match.ts.
+export { isExcluded } from "./_match.js";
 
 // ---------------------------------------------------------------------------------------------
 // Outbound disclosure check

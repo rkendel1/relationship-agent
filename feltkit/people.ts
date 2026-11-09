@@ -138,6 +138,26 @@ export const importContacts = app.mutation({
   },
 });
 
+/**
+ * Corrects a person's own record (address, organization, title). An approval for external delivery
+ * names the address it was approved for, so changing it invalidates that approval.
+ */
+export const update = app.mutation({
+  access: "connector.write",
+  retry: { sequenceConflicts: 3 },
+  args: { id: s.string(), email: s.optional(s.string({ maxLength: 200 })), organization: s.optional(s.string({ maxLength: 160 })), title: s.optional(s.string({ maxLength: 160 })) },
+  handler: async (ctx, { id, email, organization, title }) => {
+    const ownerId = me(ctx).id;
+    await owned(ctx, people, id, "person");
+    const v = (x?: string) => (x === undefined ? {} : x.trim() ? { value: x.trim() } : { value: undefined });
+    const patch: Record<string, string | undefined> = {};
+    for (const [k, x] of Object.entries({ email, organization, title })) if (x !== undefined) patch[k] = v(x).value;
+    if (!Object.keys(patch).length) fail("INVALID_ARGUMENT", "Nothing to change.");
+    await ctx.db.patch(people, id, patch);
+    await audit(ctx, ownerId, "person.updated", "person", id, { fields: Object.keys(patch).join(",") });
+  },
+});
+
 /** Records a claim about a person: the owner's own note, or a public URL the owner supplied. */
 export const addEvidence = app.mutation({
   access: "connector.write",

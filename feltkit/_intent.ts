@@ -64,7 +64,8 @@ export function interpretBrief(text: string): Interpretation {
   return { opportunityType, target, topics, ...(geography ? { geography } : {}), ...(timing ? { timing } : {}), ...(successCondition ? { successCondition } : {}), confidential, excludedOrganizations, questions };
 }
 
-const GENERIC = new Set(["evaluate", "evaluating", "evaluation", "review", "reviewing", "advice", "feedback", "project", "projects", "work", "working", "job", "role", "position", "career", "hire", "hiring", "invest", "investment", "fundraising", "raise", "raising", "pilot", "help", "helping", "understand", "understands", "knows", "experience", "experienced", "good", "great", "best", "right", "early", "stage"]);
+/** Words that describe the request rather than the subject; never search terms. */
+export const GENERIC = new Set(["evaluate", "evaluating", "evaluation", "review", "reviewing", "advice", "feedback", "project", "projects", "work", "working", "job", "role", "position", "career", "hire", "hiring", "invest", "investment", "fundraising", "raise", "raising", "pilot", "help", "helping", "understand", "understands", "knows", "experience", "experienced", "good", "great", "best", "right", "early", "stage"]);
 
 function stripExclusions(text: string): string {
   return text.replace(/\b(?:not|exclude|excluding|except|avoid)\b[^.;,]*/gi, " ");

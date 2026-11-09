@@ -24,6 +24,7 @@ export const save = app.mutation({
     boundaries: s.string({ maxLength: 1000 }),
     openToIntroductions: s.boolean(),
     introTopics: list,
+    needsVisible: s.optional(s.boolean()),
   },
   handler: async (ctx, args) => {
     const ownerId = me(ctx).id;
@@ -36,6 +37,7 @@ export const save = app.mutation({
       expertise: normalizeTopics(args.expertise),
       needs: args.needs.map((p) => p.trim()).filter(Boolean),
       introTopics: normalizeTopics(args.introTopics),
+      needsVisible: args.needsVisible ?? false,
       updatedAt: Date.now(),
     };
     const existing = (await ctx.db.find(profiles, { ownerId }))[0];
