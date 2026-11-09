@@ -13,7 +13,7 @@ import { fail, s } from "@feltdb/feltkit";
 import { app, blocks, briefs, consentGrants, evidence, introductionEvents, introductions, matches, people, profiles, SHAREABLE_FIELDS } from "./app.js";
 import { audit, currentEvidence, ensureSource, me, owned, relationshipState, transitionRelationship } from "./_access.js";
 import { canMoveIntroduction, isExcluded, scanDisclosure, type IntroState } from "./_rules.js";
-import { truncate } from "./_text.js";
+import { overlap, truncate } from "./_text.js";
 
 export const REQUEST_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 export const GRANT_TTL_MS = 90 * 24 * 60 * 60 * 1000;
@@ -97,13 +97,19 @@ export const draft = app.mutation({
     const who = mine?.displayName ?? ownerId;
     const first = person.name.split(/\s+/)[0];
 
-    // Minimum necessary context: what is sought, and only shareable evidence for "why you".
-    const why = ev.find((e) => e.scope === "shareable");
+    // Minimum necessary context: what is sought, and why this person. Private evidence (your notes,
+    // imported contacts) is never quoted; a participant is told which of their own topics matched.
+    const participantEv = ev.find((e) => e.sourceType === "participant_statement");
+    const publicEv = ev.find((e) => e.sourceType === "public_url");
+    const matched = participantEv ? [...new Set(overlap(participantEv.topics, brief.topics))] : [];
+    const why = matched.length ? ` Why you: you said you take requests about ${matched.join(", ")}.` : publicEv ? ` Why you: ${truncate(publicEv.claim, 300)} (${publicEv.sourceRef})` : "";
     const sharedContext = brief.confidential
       ? `${who} is privately exploring opportunities related to ${brief.topics.join(", ")}.`
-      : `${who}${mine?.headline ? ` (${mine.headline})` : ""} is looking for ${brief.target || brief.topics.join(", ")}.${why ? ` Why you: ${truncate(why.claim, 300)}` : ""}`;
+      : `${who}${mine?.headline ? ` (${mine.headline})` : ""} is looking for ${brief.target || brief.topics.join(", ")}.${why}`;
     const greeting = state === "unknown" || state === "observed" || state === "introducible" ? `Hi ${first} — we haven't met.` : `Hi ${first},`;
-    const message = `${greeting} ${sharedContext} Would you be open to a short conversation? If not, no reply is needed.`;
+    const ask = "Would you be open to a short conversation? If not, no reply is needed.";
+    // In-app requests show the shared context beside the message, so the message does not repeat it.
+    const message = person.linkedUserId ? `${greeting} ${ask}` : `${greeting} ${sharedContext} ${ask}`;
 
     const n = (await ctx.db.count(introductions, { matchId })) + 1;
     const now = Date.now();

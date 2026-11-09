@@ -15,7 +15,11 @@ export const list = app.query({
 export const get = app.query({
   access: "connector.read",
   args: { id: s.string() },
-  handler: async (ctx, { id }) => owned(ctx, briefs, id, "brief"),
+  handler: async (ctx, { id }) => {
+    const brief = await ctx.db.get(briefs, id);
+    if (!brief || brief.ownerId !== me(ctx).id) fail("NOT_FOUND", `No brief ${id}.`);
+    return brief;
+  },
 });
 
 /**

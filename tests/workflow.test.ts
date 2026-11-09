@@ -71,6 +71,8 @@ test("vertical slice: brief → evidence-backed matches → approved request →
     assert.equal(intro.state, "draft");
     assert.equal(intro.path, "participant");
     assert.match(intro.message, /we haven't met/);
+    assert.match(intro.sharedContext, /you said you take requests about/);
+    assert.ok(!`${intro.sharedContext} ${intro.message}`.includes("Reviewed my database"), "private evidence about others is never quoted");
     assert.deepEqual(await linus.query(api.introductions.incoming), [], "a draft is invisible to the recipient");
     assert.equal((await notificationsFor(t, "linus")).length, 0);
 
